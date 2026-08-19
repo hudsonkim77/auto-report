@@ -1,0 +1,7 @@
+streamlit
+pandas
+pyyaml
+google-cloud-bigquery
+pyarrow
+fpdf2
+plotly

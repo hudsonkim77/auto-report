@@ -1,0 +1,4 @@
+outputs/run_*/
+__pycache__/
+.streamlit/secrets.toml
+*.pyc
