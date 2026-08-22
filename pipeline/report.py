@@ -15,6 +15,7 @@ _fmt/_fmt_delta가 common.py의 서식과 별도로 존재했던 것 — phrasin
 from __future__ import annotations
 
 import datetime as dt
+import html as html_lib
 import re
 import sys
 from pathlib import Path
@@ -23,6 +24,7 @@ from fpdf import FPDF
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import config  # noqa: E402
+from common import COLOR_SLATE  # noqa: E402
 from pipeline import phrasing  # noqa: E402
 from pipeline import manual_sections  # noqa: E402
 
@@ -799,6 +801,136 @@ def build_pdf(report_md: str) -> bytes:
         i += 1
 
     return bytes(pdf.output())
+
+
+def _inline_html(text: str) -> str:
+    """**굵게**만 처리해서 안전한 HTML로 바꾼다. build_pdf가 쓰는 _split_bold와
+    같은 파싱을 재사용한다 — PDF와 화면 미리보기가 같은 마크다운을 서로 다르게
+    읽으면 두 출력이 다른 리포트처럼 보일 수 있다."""
+    return "".join(
+        f"<strong>{html_lib.escape(chunk)}</strong>" if bold else html_lib.escape(chunk)
+        for chunk, bold in _split_bold(text)
+    )
+
+
+_REPORT_HTML_STYLE = f"""<style>
+  body {{
+    margin: 0; padding: 20px 28px 32px;
+    font-family: 'Malgun Gothic', '맑은 고딕', sans-serif;
+    color: #0f172a; line-height: 1.65; background: #ffffff;
+  }}
+  h1 {{ font-size: 21px; margin: 0 0 14px; }}
+  h2 {{ font-size: 16px; margin: 26px 0 10px; border-bottom: 2px solid #0f172a; padding-bottom: 6px; }}
+  h3 {{ font-size: 13.5px; margin: 16px 0 6px; color: #1e293b; }}
+  p {{ margin: 5px 0; font-size: 13px; }}
+  ul {{ margin: 6px 0; padding-left: 20px; }}
+  li {{ margin: 3px 0; font-size: 13px; }}
+  blockquote {{
+    margin: 8px 0; padding: 8px 14px; border-left: 3px solid {COLOR_SLATE};
+    color: {COLOR_SLATE}; background: #f8fafc; font-size: 12.5px;
+  }}
+  hr {{ border: none; border-top: 1px solid #e2e8f0; margin: 18px 0; }}
+  table {{ border-collapse: collapse; width: 100%; margin: 8px 0; font-size: 12.5px; }}
+  th, td {{ border: 1px solid #e2e8f0; padding: 6px 10px; text-align: left; }}
+  th {{ background: #f8fafc; font-weight: 700; }}
+</style>"""
+
+
+def build_report_html(report_md: str) -> str:
+    """report_md를 화면 미리보기용 HTML로 그린다.
+
+    st.markdown(report_md)를 그대로 쓰지 않는 이유: 리포트는 8장 분량의
+    긴 문서라, Streamlit 자체 마크다운 렌더러에 그대로 맡기면 페이지의 다른
+    CSS와 섞여 보일 수 있다. 7단계 이메일 미리보기가 이미 같은 문제를
+    st.iframe(독립된 프레임)으로 풀어놨다 — 그 형태를 6단계에도 그대로
+    가져온다.
+
+    build_pdf와 같은 줄 단위 파싱(#/##/###, >, |표|, "- " 불릿, "---",
+    평문단)을 그대로 따른다 — 두 렌더러가 같은 마크다운을 다르게 읽으면
+    PDF와 화면 미리보기가 서로 다른 리포트처럼 보일 수 있다.
+    """
+    lines = report_md.splitlines()
+    body = []
+    i, n = 0, len(lines)
+
+    while i < n:
+        stripped = lines[i].strip()
+
+        if not stripped:
+            i += 1
+            continue
+
+        if stripped == "---":
+            body.append("<hr>")
+            i += 1
+            continue
+
+        if stripped.startswith("### "):
+            body.append(f"<h3>{_inline_html(stripped[4:])}</h3>")
+            i += 1
+            continue
+        if stripped.startswith("## "):
+            body.append(f"<h2>{_inline_html(stripped[3:])}</h2>")
+            i += 1
+            continue
+        if stripped.startswith("# "):
+            body.append(f"<h1>{_inline_html(stripped[2:])}</h1>")
+            i += 1
+            continue
+
+        if stripped.startswith(">"):
+            quote_lines = []
+            while i < n and lines[i].strip().startswith(">"):
+                text = lines[i].strip().lstrip(">").strip()
+                if text:
+                    quote_lines.append(text)
+                i += 1
+            body.append("<blockquote>" + "<br>".join(_inline_html(t) for t in quote_lines) + "</blockquote>")
+            continue
+
+        if _TABLE_ROW_RE.match(stripped):
+            table_lines = []
+            while i < n and _TABLE_ROW_RE.match(lines[i].strip()):
+                table_lines.append(lines[i].strip())
+                i += 1
+            rows = []
+            for tl in table_lines:
+                inner = tl[1:-1] if tl.endswith("|") else tl[1:]
+                if _SEPARATOR_ROW_RE.match(inner):
+                    continue
+                rows.append([c.strip() for c in inner.split("|")])
+            if rows:
+                head, *data_rows = rows
+                thead = "".join(f"<th>{_inline_html(c)}</th>" for c in head)
+                tbody = "".join(
+                    "<tr>" + "".join(f"<td>{_inline_html(c)}</td>" for c in r) + "</tr>"
+                    for r in data_rows
+                )
+                body.append(f"<table><thead><tr>{thead}</tr></thead><tbody>{tbody}</tbody></table>")
+            continue
+
+        if stripped.startswith("- "):
+            items = []
+            while i < n and lines[i].strip().startswith("- "):
+                items.append(lines[i].strip()[2:])
+                i += 1
+            body.append("<ul>" + "".join(f"<li>{_inline_html(t)}</li>" for t in items) + "</ul>")
+            continue
+
+        # 평문단 — 빈 줄이나 다른 구조(제목·인용·불릿·표·구분선)가 나오기 전까지
+        # 한 문단으로 묶는다.
+        para = [stripped]
+        i += 1
+        while i < n and lines[i].strip() and not lines[i].strip().startswith(("#", ">", "- ", "|")) \
+                and lines[i].strip() != "---":
+            para.append(lines[i].strip())
+            i += 1
+        body.append(f"<p>{_inline_html(' '.join(para))}</p>")
+
+    return (
+        "<!doctype html><html><head><meta charset=\"utf-8\">"
+        f"{_REPORT_HTML_STYLE}</head><body>{''.join(body)}</body></html>"
+    )
 
 
 # ---------------------------------------------------------------------------

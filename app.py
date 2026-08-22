@@ -1680,11 +1680,16 @@ def render_step6():
             for w in warnings:
                 st.markdown(status_badge(w, "경고"), unsafe_allow_html=True)
 
-        # 리포트 본문 미리보기 — "생성 완료" 배지만 보여주고 실제 내용은
-        # 안 그리는 회귀가 있었다(병합/미작성 장 배지를 추가하면서 이 줄이
-        # 빠졌다, 실측으로 확인함). 그때 만든 마크다운을 화면에 그대로 낸다.
+        # 리포트 본문 미리보기 — st.markdown()에 그대로 맡기던 버전은 "생성
+        # 완료" 배지만 보여주고 실제 내용은 안 그리는 회귀가 있었다(병합/
+        # 미작성 장 배지를 추가하면서 이 줄이 빠졌다, 실측으로 확인함). 그
+        # 회귀를 고치면서 7단계 이메일 미리보기와 같은 방식(독립된
+        # st.iframe)으로 바꿨다 — 8장 분량 문서를 화면 마크다운 렌더러에
+        # 그대로 맡기면 페이지의 다른 CSS와 섞여 보일 수 있는데, 이메일
+        # 미리보기가 이미 iframe으로 그 문제를 안정적으로 풀어놨다.
         st.divider()
-        st.markdown(st.session_state.report_md)
+        st.subheader("리포트 미리보기")
+        st.iframe(reporter.build_report_html(st.session_state.report_md), height="content")
 
     with st.expander("사람 작성분 편집"):
         st.caption(f"manual/sections.md · 대상기간 {period}")
