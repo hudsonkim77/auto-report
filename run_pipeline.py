@@ -397,6 +397,13 @@ def main(argv=None) -> int:
     comparison_df = comparator.compare(current_metric_df, prev_df, metrics_catalog)  # 당월 vs 전월 비교표
     comparison_df.to_csv(run_dir / "comparison.csv", index=False, encoding="utf-8-sig")
 
+    # 이력 테이블 적재는 부가 기록이라, 실패해도(예: 권한 문제) 실행 자체를
+    # 막지는 않는다 — 이미 run_dir·csv로 로컬 기록은 남아 있다.
+    try:
+        calculator.save_run_history(comparison_df, run_id, table_name, period["최소"], client)
+    except calculator.AuthError as e:
+        _log("3단계 검증", f"경고 — 실행 이력을 BigQuery에 남기지 못함(계산 결과는 정상): {e}")
+
     # validate_all()에 넘길 지표별 상세 표(metric_id·값·상태·표본수 등)를 만든다.
     metrics_df = pd.DataFrame([{
         "metric_id": r.metric_id, "지표명": r.지표명, "유형": r.유형, "month": r.month,

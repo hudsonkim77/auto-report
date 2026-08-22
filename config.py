@@ -55,6 +55,12 @@ STAGING_PREFIX = "staging_"
 # 만료 시간을 걸어 BigQuery가 스스로 정리하게 한다.
 STAGING_TABLE_TTL_DAYS = 7
 
+# 실행 이력(스냅샷) 테이블 — 만료 없음. 스테이징은 조회가 끝나면 곧 사라지는
+# 임시본이라, "이 실행에서 어떤 값이 나왔는지"라는 흔적은 별도로 영구 보관해야
+# 클라우드에서 앱이 재시작돼도(파일시스템이 껑껑이라 outputs/ 로컬 폴더가
+# 날아가도) 과거 실행 기록이 남는다.
+RUN_HISTORY_TABLE = "run_history"
+
 # --- 이메일(초안용, 실제 발송 없음) ---
 EMAIL_TO = "team@example.com"
 EMAIL_FROM = "auto-report@example.com"

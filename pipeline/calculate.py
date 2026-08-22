@@ -544,6 +544,43 @@ def calculate_metrics(
     )
 
 
+def save_run_history(comparison_df: pd.DataFrame, run_id: str, table_name: str, period: str, client: bigquery.Client) -> None:
+    """이번 실행의 전월 대비 스냅샷을 영구 이력 테이블(config.RUN_HISTORY_TABLE)에
+    남긴다. 리포트 화면에서 요구된 "빅쿼리 조회 스냅샷을 지난 흔적으로 남긴다"는
+    구조를 담당한다.
+
+    스테이징 테이블(load_staging_table)과 반대로 WRITE_APPEND를 쓰는 이유: 저건
+    조회용 임시본이라 실행마다 새로 덮어써도(오히려 격리해도) 되지만, 이력
+    테이블은 실행마다 쌓여야 하는 기록이라 이전 실행의 행을 지우면 안 된다.
+    만료(TTL)도 걸지 않는다 — 이 테이블 자체가 "지난 흔적"이다.
+
+    ALLOW_FIELD_ADDITION/RELAXATION을 여는 이유: comparison_df의 컬럼은
+    compare.py가 정하는데, 나중에 비교 항목이 늘어나도(예: 새 변화 지표 추가)
+    이 함수를 고치지 않고 그대로 이력에 쌓일 수 있게 한다.
+    """
+    row = comparison_df.copy()
+    row.insert(0, "run_id", run_id)
+    row.insert(1, "created_at", dt.datetime.now(dt.timezone.utc))
+    row.insert(2, "source_table", table_name)
+    row.insert(3, "period", period)
+
+    table_id = f"{config.BQ_DATASET}.{config.RUN_HISTORY_TABLE}"
+    job_config = bigquery.LoadJobConfig(
+        write_disposition=bigquery.WriteDisposition.WRITE_APPEND,
+        schema_update_options=[
+            bigquery.SchemaUpdateOption.ALLOW_FIELD_ADDITION,
+            bigquery.SchemaUpdateOption.ALLOW_FIELD_RELAXATION,
+        ],
+    )
+    try:
+        job = client.load_table_from_dataframe(row, table_id, job_config=job_config)
+        job.result()
+    except auth_exceptions.DefaultCredentialsError as e:
+        raise AuthError(str(e)) from e
+    except gax_exceptions.Forbidden as e:
+        raise AuthError(str(e)) from e
+
+
 def save_metrics_csv(results: list, run_dir: Path) -> Path:
     """계산 결과를 outputs/run_*/metrics.csv로 저장한다."""
     rows = [{
