@@ -557,6 +557,15 @@ def save_run_history(comparison_df: pd.DataFrame, run_id: str, table_name: str, 
     ALLOW_FIELD_ADDITION/RELAXATION을 여는 이유: comparison_df의 컬럼은
     compare.py가 정하는데, 나중에 비교 항목이 늘어나도(예: 새 변화 지표 추가)
     이 함수를 고치지 않고 그대로 이력에 쌓일 수 있게 한다.
+
+    로드 뒤에 만료를 매번 config.RUN_HISTORY_TTL_DAYS 뒤로 되돌리는(연장하는)
+    이유: project1_day1 데이터셋에 데이터셋 단위 기본 만료(60일)가 걸려 있어
+    새로 생기는 테이블은 이걸 그대로 물려받는데, 처음엔 이 테이블에
+    expires=None(무기한)을 주려고 했다가 "결제 계정 없는 BigQuery 샌드박스는
+    60일 미만 만료만 허용한다"는 403을 실제로 받고 알게 됐다(config.py
+    RUN_HISTORY_TTL_DAYS 주석 참고). 그래서 완전한 무기한은 불가능하고,
+    대신 실행마다 만료 시점을 "지금부터 59일 뒤"로 계속 밀어낸다 — 파이프라인이
+    이 기간 안에 한 번이라도 돌면 이력이 끊기지 않는다.
     """
     row = comparison_df.copy()
     row.insert(0, "run_id", run_id)
@@ -575,6 +584,10 @@ def save_run_history(comparison_df: pd.DataFrame, run_id: str, table_name: str, 
     try:
         job = client.load_table_from_dataframe(row, table_id, job_config=job_config)
         job.result()
+
+        table_ref = client.get_table(table_id)
+        table_ref.expires = dt.datetime.now(dt.timezone.utc) + dt.timedelta(days=config.RUN_HISTORY_TTL_DAYS)
+        client.update_table(table_ref, ["expires"])
     except auth_exceptions.DefaultCredentialsError as e:
         raise AuthError(str(e)) from e
     except gax_exceptions.Forbidden as e:
