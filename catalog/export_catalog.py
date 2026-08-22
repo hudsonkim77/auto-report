@@ -25,9 +25,11 @@ import config  # noqa: E402
 CATALOG_DIR = Path(__file__).resolve().parent
 
 HEADING_RE = re.compile(r"^(#{1,6})\s+(.*)$")
+H1_RE = re.compile(r"^#\s+(.*)$")
 STRIKETHROUGH_RE = re.compile(r"~~.*~~")
 ARROW_OR_REALNAME_RE = re.compile(r"→|실물명")
 SEPARATOR_ROW_RE = re.compile(r"^[\s\-:|]+$")
+INSIGHT_LINK_RE = re.compile(r"\[\[(i-\d+[^\]|]*)\]\]")
 
 
 # ---------------------------------------------------------------------------
@@ -48,6 +50,19 @@ def load_frontmatter_and_body(path: Path):
     except yaml.YAMLError:
         return None, None
     return fm, parts[2]
+
+
+def extract_insight_links(body: str) -> list:
+    """본문에서 [[i-005-요금제지역-이탈률]] 같은 인사이트 위키링크를 찾아
+    insight_id(=인사이트 노트 파일명) 목록으로 뽑는다. 같은 노트를 본문
+    여러 곳에서 링크하는 경우가 실제로 있어(예: monthly_churn_rate.md가
+    i-005를 두 번 언급) 처음 나온 순서를 유지하며 중복을 제거한다."""
+    seen = []
+    for m in INSIGHT_LINK_RE.finditer(body):
+        insight_id = m.group(1).strip()
+        if insight_id not in seen:
+            seen.append(insight_id)
+    return seen
 
 
 def find_section(body: str, keyword: str):
@@ -99,7 +114,64 @@ def build_metrics_catalog(wiki_path: Path):
 
         entry = dict(fm)
         entry["답할_수_없는_것"] = find_section(body, "답할 수 없")
+        # 임계값_상태(잠정/확정)는 프론트매터 필드고, 그 사유(사람이 읽는 긴 설명)는
+        # 본문에 둔다 — "답할_수_없는_것"과 같은 이유로, 짧은 사실은 프론트매터,
+        # 서술은 본문에 두는 이 위키의 관례를 그대로 따른다.
+        entry["임계값_근거"] = find_section(body, "임계값 근거")
+        # tags는 이미 fm(프론트매터) 안에 있으면 dict(fm)에 그대로 들어온다 —
+        # 별도 로직으로 다시 채우지 않는다. 없는 노트는 그냥 없는 대로 둔다
+        # (없다고 빈 리스트를 만들어 넣으면 "원래 없다"와 "있는데 비었다"가
+        # 구분이 안 된다).
+        entry["관련인사이트_본문링크"] = extract_insight_links(body)
         catalog[metric_id] = entry
+        read_count += 1
+
+    return catalog, read_count, skipped
+
+
+# ---------------------------------------------------------------------------
+# insights_catalog.json
+# ---------------------------------------------------------------------------
+
+def extract_title(body: str, fallback: str) -> str:
+    """본문 첫 H1(# 제목)을 노트 제목으로 쓰고, 없으면 파일명을 쓴다.
+    04_insights 노트들은 실제로는 프론트매터 다음에 바로 "## 근거"로
+    시작해서(H1이 없다) 대부분 파일명으로 떨어진다 — 그래도 나중에 누가
+    H1을 넣는 관례로 바꾸면 그쪽을 우선하도록 순서를 정해 둔다."""
+    for line in body.splitlines():
+        m = H1_RE.match(line.strip())
+        if m:
+            return m.group(1).strip()
+    return fallback
+
+
+def build_insights_catalog(wiki_path: Path):
+    insights_dir = wiki_path / "04_insights"
+    catalog = {}
+    read_count = 0
+    skipped = []
+
+    for path in sorted(insights_dir.glob("*.md")):
+        if path.name.startswith("_") or path.name == "README.md":
+            continue
+
+        fm, body = load_frontmatter_and_body(path)
+        if fm is None:
+            warnings.warn(f"프론트매터 없음/파싱 실패, 건너뜀: {path.name}")
+            skipped.append((path.name, "프론트매터 없음/파싱 실패"))
+            continue
+
+        insight_id = path.stem
+
+        시사점 = find_section(body, "시사점")
+        if 시사점 is None:
+            시사점 = find_section(body, "해석")
+
+        entry = dict(fm)
+        entry["제목"] = extract_title(body, insight_id)
+        entry["시사점"] = 시사점
+
+        catalog[insight_id] = entry
         read_count += 1
 
     return catalog, read_count, skipped
@@ -258,8 +330,13 @@ def save_json(data: dict, path: Path, wiki_path: Path, count: int):
         }
     }
     output.update(data)
+    # default=str: 04_insights의 date/updated 필드는 YAML이 "2026-08-14"를
+    # 문자열이 아니라 datetime.date로 자동 해석한다(06_metrics 프론트매터에는
+    # 이런 필드가 없어서 지금까지는 안 걸렸다, 실측으로 확인함). 값을 임의로
+    # 재해석하지 않고 원래 표기 그대로(ISO 문자열) 남기는 가장 단순한 방법이라
+    # date.__str__()에 맡긴다.
     path.write_text(
-        json.dumps(output, ensure_ascii=False, indent=2),
+        json.dumps(output, ensure_ascii=False, indent=2, default=str),
         encoding="utf-8",
     )
 
@@ -282,6 +359,29 @@ def main() -> int:
         print(f"  - {name}: {reason}")
     print()
 
+    # --- insights_catalog ---
+    insights, i_read, i_skipped = build_insights_catalog(wiki_path)
+    save_json(insights, CATALOG_DIR / "insights_catalog.json", wiki_path, len(insights))
+
+    print(f"[insights_catalog] 읽음 {i_read}개 / 건너뜀 {len(i_skipped)}개")
+    for name, reason in i_skipped:
+        print(f"  - {name}: {reason}")
+    print()
+
+    tags_없는_지표 = [mid for mid, fm in metrics.items() if not fm.get("tags")]
+    if tags_없는_지표:
+        print(f"tags 없는 지표({len(tags_없는_지표)}개, 프론트매터에 원래 없어서 못 채움): "
+              f"{', '.join(tags_없는_지표)}")
+    else:
+        print("tags: 모든 지표 프론트매터에 이미 있음(추가 작업 없음)")
+    print()
+
+    print("지표별 본문 내 인사이트 링크([[i-XXX]]) 개수:")
+    for metric_id, fm in metrics.items():
+        links = fm.get("관련인사이트_본문링크", [])
+        print(f"  - {metric_id}: {len(links)}개" + (f" ({', '.join(links)})" if links else ""))
+    print()
+
     # --- schema_catalog ---
     schema, s_read, s_skipped, dirty_notes = build_schema_catalog(wiki_path)
     save_json(schema, CATALOG_DIR / "schema_catalog.json", wiki_path, len(schema))
@@ -297,7 +397,7 @@ def main() -> int:
             print(f"  - {name}")
         print()
 
-    print(f"요약: metrics {len(metrics)}개 / tables {len(schema)}개")
+    print(f"요약: metrics {len(metrics)}개 / insights {len(insights)}개 / tables {len(schema)}개")
     return 0
 
 

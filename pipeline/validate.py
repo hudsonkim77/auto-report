@@ -210,15 +210,35 @@ def check_derived_consistency(
 # 4. 전월 대비 이상 변동
 # ---------------------------------------------------------------------------
 
-def check_month_over_month(comparison_df, threshold=None) -> list:
-    """상대변화율 절대값이 threshold(기본 config.MOM_THRESHOLD=5.0) 이상이면 경고.
+def _resolve_threshold(metric_id: str, metrics_catalog: dict, default_threshold: float):
+    """지표 정의서의 "변동임계값"이 있으면 그 값을, 없으면 기본값을 쓴다.
+    (임계값, 출처) 튜플을 반환한다 — 화면에 "정의서 지정"인지 "기본값"인지
+    구분해서 보여줘야 하므로 출처도 함께 넘긴다."""
+    metric_fm = metrics_catalog.get(metric_id, {})
+    지표별_임계값 = metric_fm.get("변동임계값")
+    if 지표별_임계값 is not None:
+        return float(지표별_임계값), "정의서 지정"
+    return default_threshold, "기본값"
+
+
+def check_month_over_month(comparison_df, metrics_catalog, threshold=None) -> list:
+    """상대변화율 절대값이 임계값 이상이면 경고.
+
+    임계값은 지표마다 다를 수 있다 — metrics_catalog[metric_id]["변동임계값"]이
+    있으면 그 값을, 없으면 threshold(기본 config.MOM_THRESHOLD=5.0)를 쓴다.
+    "몇 %가 이상인가"는 지표 성격에 따라 다르다는 걸 avg_data_usage(계절 변동이
+    커서 10.0)와 active_customers_contract(계약 기반이라 1.0)에서 실제로 확인했다
+    — 하나의 전역 기준으로는 한쪽은 과다 경고, 다른 쪽은 과소 경고가 난다.
+
     "비교 불가"는 문제가 아니라 "볼 수 없다"는 사실이라 경고가 아니라 통과로
     남긴다(전월이 원래 없는 첫 달 같은 정상 상황일 수 있다)."""
-    threshold = config.MOM_THRESHOLD if threshold is None else threshold
+    default_threshold = config.MOM_THRESHOLD if threshold is None else threshold
 
     findings = []
     for _, row in comparison_df.iterrows():
         metric_id = row["metric_id"]
+        applied_threshold, 출처 = _resolve_threshold(metric_id, metrics_catalog, default_threshold)
+
         if row["비교상태"] == "비교 불가":
             findings.append(_finding(
                 "전월 대비", metric_id, "통과",
@@ -229,17 +249,23 @@ def check_month_over_month(comparison_df, threshold=None) -> list:
 
         율 = row["상대변화율"]
         if 율 is None or 율 != 율:  # NaN
-            findings.append(_finding("전월 대비", metric_id, "통과", "상대변화율 없음", None))
+            findings.append(_finding(
+                "전월 대비", metric_id, "통과",
+                f"상대변화율 없음 (적용 임계값 {applied_threshold}%, {출처})", None,
+            ))
             continue
 
-        if abs(율) >= threshold:
+        if abs(율) >= applied_threshold:
             findings.append(_finding(
                 "전월 대비", metric_id, "경고",
-                f"{율:+.2f}% (임계값 {threshold}% 초과)", 율,
+                f"{율:+.2f}% (임계값 {applied_threshold}% 초과, {출처})",
+                {"상대변화율": 율, "적용임계값": applied_threshold, "임계값_출처": 출처},
             ))
         else:
             findings.append(_finding(
-                "전월 대비", metric_id, "통과", f"{율:+.2f}% (임계값 {threshold}% 이내)", 율,
+                "전월 대비", metric_id, "통과",
+                f"{율:+.2f}% (임계값 {applied_threshold}% 이내, {출처})",
+                {"상대변화율": 율, "적용임계값": applied_threshold, "임계값_출처": 출처},
             ))
     return findings
 
@@ -284,7 +310,7 @@ def validate_all(
         metrics_df, metrics_catalog, client, dataset, table_override,
         uploaded_months, override,
     )
-    findings += check_month_over_month(comparison_df, threshold)
+    findings += check_month_over_month(comparison_df, metrics_catalog, threshold)
     findings += check_totals(metrics_df)
 
     차단수 = sum(1 for f in findings if f["판정"] == "차단")

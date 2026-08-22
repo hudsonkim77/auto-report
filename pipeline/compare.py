@@ -9,10 +9,15 @@
 
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
 import pandas as pd
 
-import config
-from pipeline import calculate as calc
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+import config  # noqa: E402
+from common import _display_kind  # noqa: E402
+from pipeline import calculate as calc  # noqa: E402
 
 
 def previous_month(period: str) -> str:
@@ -78,7 +83,7 @@ def metric_results_to_df(results: list) -> pd.DataFrame:
     return pd.DataFrame(rows, columns=["metric_id", "지표명", "유형", "값", "상태"])
 
 
-def compare(current_df: pd.DataFrame, previous_df: pd.DataFrame) -> pd.DataFrame:
+def compare(current_df: pd.DataFrame, previous_df: pd.DataFrame, metrics_catalog: dict) -> pd.DataFrame:
     """당월/전월 결과를 metric_id로 조인해 변화를 계산한다.
 
     입력 스키마: 두 DataFrame 모두 calc_previous()/metric_results_to_df()가
@@ -94,11 +99,17 @@ def compare(current_df: pd.DataFrame, previous_df: pd.DataFrame) -> pd.DataFrame
     ZeroDivisionError거나(값이 실제 0), 무한대로 튀거나 하는데 둘 다 의미
     있는 "변화율"이 아니다. 0에서 늘어난 건 상대적으로 몇 %인지 말할 수 없다.
 
-    퍼센트포인트(%p) 변화를 비율형에서 따로 계산하는 이유: 비율형 지표의
+    퍼센트포인트(%p) 변화를 비율 지표에서 따로 계산하는 이유: 비율 지표의
     "값"은 0.05(=5%) 같은 소수다. 상대변화율(예: +40%)은 "원래 대비 얼마나
     늘었나"를 말하고, %p변화(예: +2%p)는 "그 비율 자체가 몇 포인트 움직였나"를
     말한다 — 이탈률이 5%→7%면 상대적으로는 40% 늘었지만 체감 규모는 2%p다.
     둘 다 의미가 달라 하나만 계산하면 다른 쪽 해석을 놓친다.
+
+    "비율인가"를 `유형.startswith("비율형")`만으로 판정하지 않는 이유: 파생형
+    (monthly_churn_rate)과 변화율형(usage_decline_rate_3m)도 값이 소수 비율인데
+    유형 문자열은 "비율형"이 아니다. common.py의 `_display_kind`가 이미 이
+    구분(파생형이면 분자 원본 지표까지 따라가서 금액/비율 판별)을 하고 있어
+    같은 기준을 재사용한다 — 화면·리포트가 같은 지표를 다르게 판정하면 안 된다.
     """
     cur = current_df.rename(columns={"값": "당월"})
     prev = previous_df[["metric_id", "값", "상태"]].rename(
@@ -129,7 +140,7 @@ def compare(current_df: pd.DataFrame, previous_df: pd.DataFrame) -> pd.DataFrame
         else:
             절대변화 = 당월 - 전월
             상대변화율 = None if 전월 == 0 else (절대변화 / 전월 * 100)
-            if str(row["유형"]).startswith("비율형"):
+            if _display_kind(row["metric_id"], metrics_catalog) == "비율":
                 pp변화 = 절대변화 * 100
             비교상태 = "OK"
 

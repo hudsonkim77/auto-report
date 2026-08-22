@@ -6,8 +6,11 @@ Model 연결까지). 실제 지표 "계산"(BigQuery 적재)은 아직 없다 �
 """
 
 import json
+import platform
 import sys
+import time
 from datetime import datetime
+from importlib import metadata as importlib_metadata
 from pathlib import Path
 
 import pandas as pd
@@ -30,11 +33,14 @@ from pipeline import calculate as calculator  # noqa: E402
 from pipeline import compare as comparator  # noqa: E402
 from pipeline import validate as validator  # noqa: E402
 from pipeline import charts as charter  # noqa: E402
+from pipeline import report as reporter  # noqa: E402
+from pipeline import manual_sections  # noqa: E402
+from pipeline import email_draft  # noqa: E402
 import plotly.graph_objects as go  # noqa: E402
 
-# 5~8단계는 아직 실제 구현이 없다. 사이드바에서 "진행중"이 아니라 "준비됨"으로
+# 7~8단계는 아직 실제 구현이 없다. 사이드바에서 "진행중"이 아니라 "준비됨"으로
 # 표시하기 위한 구분이다(게이트를 통과했다고 없는 기능이 갑자기 "진행중"이 되면 안 된다).
-IMPLEMENTED_STEPS = {1, 2, 3, 4}
+IMPLEMENTED_STEPS = {1, 2, 3, 4, 5, 6, 7, 8}
 
 STEPS = [
     (1, "데이터 파일 투입"),
@@ -59,6 +65,8 @@ def init_session_state():
     st.session_state.setdefault("df", None)
     st.session_state.setdefault("filename", None)
     st.session_state.setdefault("file_bytes", None)
+    st.session_state.setdefault("upload_time", None)
+    st.session_state.setdefault("stage_durations", {})
     st.session_state.setdefault("table_judgment", None)
     st.session_state.setdefault("profile_result", None)
     st.session_state.setdefault("metric_judgments", None)
@@ -70,6 +78,24 @@ def init_session_state():
     st.session_state.setdefault("prev_period", None)
     st.session_state.setdefault("staging_table", None)
     st.session_state.setdefault("validation_result", None)
+    st.session_state.setdefault("chk_period", False)
+    st.session_state.setdefault("chk_warnings", False)
+    st.session_state.setdefault("chk_partial", False)
+    st.session_state.setdefault("chk_skipped", False)
+    st.session_state.setdefault("step5_confirmed_at", None)
+    st.session_state.setdefault("report_md", None)
+    st.session_state.setdefault("report_path", None)
+    st.session_state.setdefault("report_substituted", None)
+    st.session_state.setdefault("report_remaining", None)
+    st.session_state.setdefault("report_warnings", None)
+    st.session_state.setdefault("email_draft", None)
+    st.session_state.setdefault("email_paths", None)
+    st.session_state.setdefault("approved_at", None)
+    st.session_state.setdefault("chk8_period", False)
+    st.session_state.setdefault("chk8_recipients", False)
+    st.session_state.setdefault("chk8_warnings", False)
+    st.session_state.setdefault("chk8_unwritten", False)
+    st.session_state.setdefault("chk8_attachments", False)
 
 
 def reset_downstream_state():
@@ -80,6 +106,8 @@ def reset_downstream_state():
     st.session_state.df = None
     st.session_state.filename = None
     st.session_state.file_bytes = None
+    st.session_state.upload_time = None
+    st.session_state.stage_durations = {}
     st.session_state.table_judgment = None
     st.session_state.profile_result = None
     st.session_state.metric_judgments = None
@@ -91,6 +119,24 @@ def reset_downstream_state():
     st.session_state.prev_period = None
     st.session_state.staging_table = None
     st.session_state.validation_result = None
+    st.session_state.chk_period = False
+    st.session_state.chk_warnings = False
+    st.session_state.chk_partial = False
+    st.session_state.chk_skipped = False
+    st.session_state.step5_confirmed_at = None
+    st.session_state.report_md = None
+    st.session_state.report_path = None
+    st.session_state.report_substituted = None
+    st.session_state.report_remaining = None
+    st.session_state.report_warnings = None
+    st.session_state.email_draft = None
+    st.session_state.email_paths = None
+    st.session_state.approved_at = None
+    st.session_state.chk8_period = False
+    st.session_state.chk8_recipients = False
+    st.session_state.chk8_warnings = False
+    st.session_state.chk8_unwritten = False
+    st.session_state.chk8_attachments = False
 
 
 init_session_state()
@@ -112,6 +158,43 @@ def read_csv_with_fallback(uploaded_file):
 # 카탈로그 로딩 (사이드바·2단계 공용)
 # ---------------------------------------------------------------------------
 
+def _update_run_log(run_dir: Path, **sections) -> dict:
+    """run_log.json을 부분 갱신한다. 8단계 전체가 서로 다른 시점(가끔은 서로
+    다른 rerun)에 자기 몫만 쓰기 때문에, 매번 파일을 다시 읽어 주어진 키만
+    덮어쓰고 나머지는 그대로 둔다 — 한 단계가 다른 단계가 이미 써둔 값을
+    지우는 사고(예: 6단계 기록이 3단계 기록을 날림)를 막는다."""
+    path = run_dir / "run_log.json"
+    run_log = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    run_log.update(sections)
+    path.write_text(json.dumps(run_log, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+    return run_log
+
+
+_ENV_PACKAGES = ["streamlit", "pandas", "google-cloud-bigquery", "pyyaml", "plotly", "fpdf2", "pyarrow"]
+
+
+def _environment_info() -> dict:
+    """실행 환경 스냅샷 — 이 실행이 어떤 버전 조합에서 돌았는지 나중에
+    추적하기 위함이다(예: 나중에 결과가 재현 안 되면 여기부터 비교한다)."""
+    versions = {}
+    for pkg in _ENV_PACKAGES:
+        try:
+            versions[pkg] = importlib_metadata.version(pkg)
+        except importlib_metadata.PackageNotFoundError:
+            versions[pkg] = "설치 안 됨"
+    return {"python_버전": platform.python_version(), "패키지_버전": versions}
+
+
+def load_insights_catalog():
+    """catalog/insights_catalog.json을 읽는다. 없으면 빈 dict — report.py의
+    5장 인용 로직은 이게 없어도(전부 "관련 분석 없음"으로) 동작하므로 여기서
+    load_catalogs()처럼 (None, None)을 강제해 화면을 막을 필요가 없다."""
+    path = CATALOG_DIR / "insights_catalog.json"
+    if not path.exists():
+        return {}
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
 def load_catalogs():
     """catalog/*.json을 읽는다. 없으면 (None, None)을 반환한다."""
     metrics_path = CATALOG_DIR / "metrics_catalog.json"
@@ -121,6 +204,170 @@ def load_catalogs():
     metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
     schema = json.loads(schema_path.read_text(encoding="utf-8"))
     return metrics, schema
+
+
+# ---------------------------------------------------------------------------
+# 기존 실행 불러오기 — run_pipeline.py(CLI)가 미리 만들어둔 run_*을
+# 화면으로 이어받아 확인·확정만 하는 흐름
+# ---------------------------------------------------------------------------
+
+HUMAN_CHAPTERS = ["2", "5", "6"]
+
+
+def _list_run_dirs() -> list:
+    output_root = APP_DIR / "outputs"
+    if not output_root.exists():
+        return []
+    return sorted(
+        (p for p in output_root.iterdir() if p.is_dir() and p.name.startswith("run_")),
+        key=lambda p: p.name, reverse=True,
+    )
+
+
+def _to_bool(v) -> bool:
+    if isinstance(v, bool):
+        return v
+    return str(v).strip().lower() == "true"
+
+
+def _load_existing_run(run_dir: Path):
+    """outputs/run_*/ 하나를 골라 그 산출물로 화면 상태를 복원한다.
+
+    run_pipeline.py(CLI)가 1~7단계를 미리 다 만들어두고, 사람은 화면에서
+    확인·확정(8단계)만 하는 흐름을 위한 진입점이다. 계산을 다시 하지 않고
+    저장된 산출물(run_log.json·metrics.csv·comparison.csv·validation.json·
+    report.md·email.html 등)만 읽는다 — BigQuery를 다시 부르지 않는다.
+
+    딱 하나, table_judgment/profile_result/metric_judgments는 저장된 적이
+    없어서 다시 계산한다. 이 셋은 df·카탈로그만으로 정해지는 순수 함수라서
+    (BigQuery를 안 쓴다) 다시 돌려도 비용이 거의 없고, run_log의 요약본보다
+    화면이 원래 기대하는 정확한 모양(예: 전체 지표 판정 표)을 그대로 낸다.
+
+    한계 — staging_table 재사용: BigQuery의 스테이징 테이블은 테이블명당
+    하나뿐이라(WRITE_TRUNCATE), 이 run 이후 다른 실행이 있었으면 그 테이블은
+    이미 최신 데이터로 덮어써져 있다. 대시보드의 "이번 실행 대상이 아니었던
+    지표" 즉석 재계산은 그 최신 스테이징을 다시 조회하므로, 오래된 run을
+    불러왔을 때 그 부분만 지금 스테이징 상태를 반영할 수 있다 — report.md·
+    email.html처럼 이미 저장된 산출물은 영향받지 않는다.
+    """
+    run_log_path = run_dir / "run_log.json"
+    run_log = json.loads(run_log_path.read_text(encoding="utf-8"))
+
+    reset_downstream_state()
+    metrics_catalog, schema_catalog = load_catalogs()
+
+    # --- 1단계: 원본 CSV ---
+    filename = run_log.get("파일명")
+    csv_path = run_dir / filename if filename else None
+    df = None
+    if csv_path and csv_path.exists():
+        with open(csv_path, "rb") as f:
+            try:
+                df = read_csv_with_fallback(f)
+            except Exception:  # noqa: BLE001 - 복원 실패해도 나머지는 보여준다
+                df = None
+
+    st.session_state.df = df
+    st.session_state.filename = filename
+    st.session_state.file_bytes = csv_path.read_bytes() if csv_path and csv_path.exists() else None
+    st.session_state.upload_time = run_log.get("1_투입", {}).get("업로드_시각")
+
+    # --- 2단계: 판정 (재계산 — BigQuery 아님) ---
+    table_name = None
+    if df is not None and metrics_catalog is not None:
+        table_judgment = profiler.judge_table(df, schema_catalog)
+        st.session_state.table_judgment = table_judgment
+        table_name = table_judgment["테이블명"]
+        table_info = schema_catalog.get(table_name, {})
+        profile_result = profiler.profile_data(df, table_info)
+        st.session_state.profile_result = profile_result
+        primary_period = next(iter(profile_result["기간컬럼"].values()), None)
+        if primary_period is not None:
+            st.session_state.metric_judgments = profiler.judge_metrics(table_name, primary_period, metrics_catalog)
+
+    # --- 2단계: 계산 결과 ---
+    metrics_csv = run_dir / "metrics.csv"
+    results = []
+    if metrics_csv.exists():
+        mdf = pd.read_csv(metrics_csv, keep_default_na=False, na_values=[""])
+        for _, row in mdf.iterrows():
+            results.append(calculator.MetricResult(
+                metric_id=row["metric_id"], 지표명=row["지표명"], 유형=row["유형"], month=str(row["month"]),
+                value=None if pd.isna(row["value"]) else row["value"],
+                sample_size=None if pd.isna(row["sample_size"]) else row["sample_size"],
+                min_sample=None if pd.isna(row["min_sample"]) else row["min_sample"],
+                status=row["status"],
+                error=None if pd.isna(row["error"]) else row["error"],
+                부분갱신=_to_bool(row["부분갱신"]),
+                원천=[t for t in str(row["원천"]).split("+") if t],
+            ))
+    st.session_state.metric_results = results
+    st.session_state.sql_log = []  # CLI 실행은 SQL 로그를 남기지 않는다
+
+    comparison_csv = run_dir / "comparison.csv"
+    st.session_state.comparison_df = pd.read_csv(comparison_csv) if comparison_csv.exists() else None
+
+    validation_path = run_dir / "validation.json"
+    st.session_state.validation_result = (
+        json.loads(validation_path.read_text(encoding="utf-8")) if validation_path.exists() else None
+    )
+
+    st.session_state.staging_table = run_log.get("2_계산", {}).get("스테이징_테이블명")
+    st.session_state.extend_approved = bool(run_log.get("유효구간_확장_승인"))
+
+    기간 = run_log.get("기간", "")
+    기간_최소 = 기간.split("~")[0].strip() if 기간 else None
+    st.session_state.prev_period = comparator.previous_month(기간_최소) if 기간_최소 else None
+
+    st.session_state.run_dir = str(run_dir)
+
+    # CLI는 화면 확인(5단계)을 사람 대신 건너뛴다 — run_log가 그 사실을 이미
+    # "생략" 사유로 남겼으므로, 여기서는 그걸 근거로 통과시킨다(추측이 아니다).
+    if run_log.get("4_5_확인", {}).get("생략") or run_log.get("4_5_확인", {}).get("게이트2_확정_시각"):
+        st.session_state.step5_confirmed_at = (
+            run_log.get("4_5_확인", {}).get("게이트2_확정_시각") or run_log.get("확정_시각")
+        )
+
+    # --- 6단계: 리포트 ---
+    report_path = run_dir / "report.md"
+    if report_path.exists():
+        st.session_state.report_md = report_path.read_text(encoding="utf-8")
+        st.session_state.report_path = str(report_path)
+        미작성 = run_log.get("6_리포트", {}).get("미작성_장_목록", [])
+        st.session_state.report_remaining = 미작성
+        st.session_state.report_substituted = [c for c in HUMAN_CHAPTERS if c not in 미작성]
+        st.session_state.report_warnings = []  # 대상기간 불일치 등 경고는 생성 시점 값이라 다시 채우지 않는다
+
+    # --- 7단계: 이메일 ---
+    email_html_path = run_dir / "email.html"
+    email_meta_path = run_dir / "email_meta.json"
+    if email_html_path.exists() and email_meta_path.exists():
+        meta = json.loads(email_meta_path.read_text(encoding="utf-8"))
+        text_path = run_dir / "email.txt"
+        st.session_state.email_draft = {
+            "subject": meta["subject"], "to": meta["to"], "from": meta["from"],
+            "body_html": email_html_path.read_text(encoding="utf-8"),
+            "body_text": text_path.read_text(encoding="utf-8") if text_path.exists() else "",
+            "attachments": meta["attachments"],
+        }
+        st.session_state.email_paths = {
+            "html": str(email_html_path), "text": str(text_path), "meta": str(email_meta_path),
+        }
+
+    # --- 8단계: 이미 확정됐으면 그대로 반영, 아니면 어디까지 왔는지로 진행 표시만 ---
+    approved_path = run_dir / "APPROVED"
+    if approved_path.exists():
+        approved = json.loads(approved_path.read_text(encoding="utf-8"))
+        st.session_state.approved_at = approved.get("발송확정_시각")
+        st.session_state.step = 9
+    elif st.session_state.email_draft:
+        st.session_state.step = 8
+    elif st.session_state.report_md:
+        st.session_state.step = 7
+    elif st.session_state.validation_result:
+        st.session_state.step = 4
+    else:
+        st.session_state.step = 2
 
 
 # ---------------------------------------------------------------------------
@@ -165,6 +412,21 @@ def render_sidebar():
                 unsafe_allow_html=True,
             )
 
+        st.divider()
+        st.header("기존 실행 불러오기")
+        run_dirs = _list_run_dirs()
+        if not run_dirs:
+            st.caption("outputs/에 run_* 폴더가 없습니다.")
+        else:
+            labels = []
+            for p in run_dirs:
+                approved = (p / "APPROVED").exists()
+                labels.append(f"{p.name} {'(확정 완료)' if approved else ''}".strip())
+            choice = st.selectbox("run 폴더 선택", options=range(len(run_dirs)), format_func=lambda i: labels[i])
+            if st.button("불러오기"):
+                _load_existing_run(run_dirs[choice])
+                st.rerun()
+
 
 # ---------------------------------------------------------------------------
 # 1단계 — 데이터 파일 투입 (오늘 실제로 구현하는 부분)
@@ -182,15 +444,18 @@ def render_step1():
     if uploaded.name != st.session_state.filename:
         reset_downstream_state()
 
+        t0 = time.time()
         try:
             df = read_csv_with_fallback(uploaded)
         except Exception as e:  # noqa: BLE001 - 사용자에게 원인을 그대로 보여준다
             st.error(f"CSV를 읽을 수 없습니다(utf-8-sig, cp949 둘 다 실패): {e}")
             return
+        st.session_state.stage_durations["1_투입"] = round(time.time() - t0, 3)
 
         st.session_state.df = df
         st.session_state.filename = uploaded.name
         st.session_state.file_bytes = uploaded.getvalue()  # 게이트 확정 시 run 폴더에 원본 복사용
+        st.session_state.upload_time = datetime.now().isoformat()
         st.session_state.step = 2  # 1단계 완료 -> 2단계로
 
     df = st.session_state.df
@@ -233,6 +498,12 @@ def render_step2():
 
     # judge_table/profile_data/judge_metrics는 순수 함수라 매번 다시 불러도
     # 비용이 크지 않다. 새 파일이 올라올 때만 다시 계산되도록 세션에 캐싱한다.
+    # fresh는 이번 rerun에서 실제로 새로 계산하는지를 표시한다 — 이미 캐싱된
+    # 결과를 그냥 다시 읽는 rerun에서까지 "2_판정" 소요시간을 거의 0으로
+    # 덮어써서 실제 소요시간을 지우는 일이 없게 한다.
+    fresh = st.session_state.table_judgment is None
+    t0 = time.time()
+
     if st.session_state.table_judgment is None:
         st.session_state.table_judgment = profiler.judge_table(df, schema_catalog)
 
@@ -268,6 +539,8 @@ def render_step2():
     if not table_judgment["판정가능"]:
         # 테이블이 확정되지 않으면 Profile·지표 판정 자체가 의미 없다(무엇과 대조할지
         # 모르는 상태). CLAUDE.md 9절: "카탈로그에 없는 테이블을 추측해 통과 금지".
+        if fresh:
+            st.session_state.stage_durations["2_판정"] = round(time.time() - t0, 3)
         return
 
     table_name = table_judgment["테이블명"]
@@ -335,6 +608,9 @@ def render_step2():
         )
     metric_judgments = st.session_state.metric_judgments or []
 
+    if fresh:
+        st.session_state.stage_durations["2_판정"] = round(time.time() - t0, 3)
+
     relevant = [m for m in metric_judgments if m["상태"] != "이 파일과 무관"]
     irrelevant = [m for m in metric_judgments if m["상태"] == "이 파일과 무관"]
 
@@ -392,8 +668,19 @@ def render_gate():
         st.write(f"확정된 실행 폴더: `{st.session_state.run_dir}`")
         st.caption("이미 만들어진 실행 기록은 취소해도 지워지지 않습니다.")
         if st.button("확정 취소"):
+            # run_dir만 지우면 계산 결과·비교·검증·대시보드·5단계가 전부 화면에
+            # 그대로 남는다 — 이 게이트가 "확정 전"으로 되돌아갔는데 그 아래는
+            # 여전히 "확정된 결과"를 보여주는 모순된 상태가 된다(실제로 클릭해서
+            # 확인한 버그). 게이트 확정 시 채워지는 상태를 전부 같이 지운다.
             st.session_state.step = 2
             st.session_state.run_dir = None
+            st.session_state.metric_results = None
+            st.session_state.sql_log = None
+            st.session_state.comparison_df = None
+            st.session_state.prev_period = None
+            st.session_state.staging_table = None
+            st.session_state.validation_result = None
+            st.session_state.step5_confirmed_at = None
             st.rerun()
         return
 
@@ -470,6 +757,7 @@ def render_gate():
     df = st.session_state.df
     table_name = table_judgment["테이블명"]
 
+    t0 = time.time()
     try:
         with st.spinner("스테이징 적재 중"):
             client = calculator.get_client()
@@ -486,6 +774,7 @@ def render_gate():
         st.write("아래 명령으로 인증한 뒤 다시 확정 버튼을 눌러주세요.")
         st.code("gcloud auth application-default login", language="bash")
         return
+    계산_소요 = round(time.time() - t0, 3)
 
     # --- 확정 처리(계산 성공 후에만) ---
     run_time = datetime.now()
@@ -497,7 +786,12 @@ def render_gate():
     if st.session_state.file_bytes is not None:
         (run_dir / st.session_state.filename).write_bytes(st.session_state.file_bytes)
 
+    insights_catalog = load_insights_catalog()
+
     run_log = {
+        # --- 기존 평평한 필드: report.py·email_draft.py가 run_context를
+        # 만들 때 그대로 읽는다. 아래 "N_단계" 구조와 내용은 겹치지만, 그
+        # 모듈들이 다시 고치지 않아도 되게 그대로 둔다.
         "파일명": st.session_state.filename,
         "행수": profile_result["행수"],
         "판정_테이블": table_judgment["테이블명"],
@@ -508,9 +802,45 @@ def render_gate():
         "유효구간_확장_승인_시각": run_time.isoformat() if 확장필요_목록 else None,
         "부분_갱신_지표": [m["metric_id"] for m in 부분갱신_목록],
         "확정_시각": run_time.isoformat(),
+
+        # --- 8단계 전체를 사람이 훑어볼 수 있는 실행 기록 ---
+        "0_카탈로그": {
+            "생성일시": catalog_generated_at,
+            "지표_개수": metrics_catalog.get("_meta", {}).get("항목_개수", "?"),
+            "테이블_개수": (load_catalogs()[1] or {}).get("_meta", {}).get("항목_개수", "?"),
+            "인사이트_개수": insights_catalog.get("_meta", {}).get("항목_개수", "?"),
+        },
+        "1_투입": {
+            "파일명": st.session_state.filename,
+            "크기_바이트": len(st.session_state.file_bytes) if st.session_state.file_bytes else None,
+            "행수": profile_result["행수"],
+            "컬럼_수": profile_result["컬럼수"],
+            "업로드_시각": st.session_state.upload_time,
+        },
+        "2_판정": {
+            "테이블": table_judgment["테이블명"],
+            "일치율": table_judgment["일치율"],
+            "기간": profile_result["기간컬럼"],
+            "결측": profile_result["결측"],
+            "그레인_후보": profile_result["그레인_후보"],
+        },
+        "2_계산": {
+            "지표별_값_상태": {r.metric_id: {"값": r.value, "상태": r.status} for r in results},
+            "스테이징_테이블명": staging_table,
+            "계산_시각": run_time.isoformat(),
+        },
+        "게이트1": {
+            "확정_시각": run_time.isoformat(),
+            "유효구간_확장_승인_여부": bool(확장필요_목록) and extend_approved,
+        },
+        "실행환경": _environment_info(),
     }
+
+    st.session_state.stage_durations["2_계산"] = 계산_소요
+    run_log["소요시간"] = dict(st.session_state.stage_durations)
+
     (run_dir / "run_log.json").write_text(
-        json.dumps(run_log, ensure_ascii=False, indent=2), encoding="utf-8"
+        json.dumps(run_log, ensure_ascii=False, indent=2, default=str), encoding="utf-8"
     )
     calculator.save_metrics_csv(results, run_dir)
 
@@ -519,7 +849,7 @@ def render_gate():
     with st.spinner(f"전월({prev_period}) 계산 중"):
         current_metric_df = comparator.metric_results_to_df(results)
         prev_df = comparator.calc_previous(target_ids, prev_period, client)
-        comparison_df = comparator.compare(current_metric_df, prev_df)
+        comparison_df = comparator.compare(current_metric_df, prev_df, metrics_catalog)
     comparison_df.to_csv(run_dir / "comparison.csv", index=False, encoding="utf-8-sig")
 
     # --- 검증 (전월 대비까지 끝나면 자동으로 이어서 실행) ---
@@ -530,15 +860,18 @@ def render_gate():
     } for r in results])
     table_override = {table_name: staging_table}
     uploaded_months = {calculator.parse_year_month(primary_period["최소"])}
+    t0 = time.time()
     with st.spinner("검증 실행 중"):
         validation_result = validator.validate_all(
             metrics_df, comparison_df, metrics_catalog, client,
             override=extend_approved, table_override=table_override,
             uploaded_months=uploaded_months,
         )
+    st.session_state.stage_durations["3_검증"] = round(time.time() - t0, 3)
     (run_dir / "validation.json").write_text(
         json.dumps(validation_result, ensure_ascii=False, indent=2, default=str), encoding="utf-8"
     )
+    _update_run_log(run_dir, **{"3_검증": validation_result, "소요시간": dict(st.session_state.stage_durations)})
 
     st.session_state.metric_results = results
     st.session_state.sql_log = sql_log
@@ -880,20 +1213,26 @@ CHART_METRIC_IDS = [
 
 
 @st.cache_data(show_spinner=False)
-def _cached_trend(metric_ids, end_period, months, staging_map_items, extend_approved,
-                   _client, _on_progress=None):
+def _cached_trend(metric_ids, end_period, months, staging_map_items, extend_approved, _client):
     """build_trend()를 st.cache_data로 감싼다.
 
-    _client·_on_progress는 이름 앞에 밑줄을 붙여 Streamlit이 해시(캐시 키 계산)
-    대상에서 뺀다 — BigQuery 클라이언트는 원래 해시할 수 없는 객체이고, 콜백은
-    "캐시가 실제로 다시 계산할 때만" 의미가 있다. 그 덕에 캐시 히트일 때는
-    on_progress가 아예 호출되지 않아(함수 본문 자체가 안 돌아가므로) 진행바가
-    필요 없는 경우 저절로 안 뜬다 — 캐시 미스일 때만 진행바가 보인다.
+    on_progress 콜백을 여기서 받지 않는 이유(실측으로 잡은 버그): 처음 시도는
+    콜백이 st.progress 위젯을 매 단계 갱신하게 했는데, **캐시 히트가 나는 두
+    번째 실행부터 Streamlit이 "레이아웃 블록 재생" 에러로 죽었다**
+    (`CacheReplayClosureError`). st.cache_data는 캐시 히트 시 "그때 그 UI
+    호출들을 다시 재생"하려고 하는데, 콜백이 건드리는 progress_bar는 이 함수
+    바깥(호출하는 쪽)에서 만들어진 위젯이라 재생 시점에 그 자리가 없다.
+    그래서 이 함수 안에서는 어떤 Streamlit UI 요소도 건드리지 않는다 — 진행
+    표시는 호출하는 쪽에서 st.spinner로 감싸는 것으로 대체했다(세부 %는
+    캐시와 공존할 수 없어 포기했다).
+
+    _client는 이름 앞에 밑줄을 붙여 해시 대상에서 뺀다 — BigQuery 클라이언트는
+    원래 해시할 수 없는 객체다.
     """
     staging_map = dict(staging_map_items)
     return charter.build_trend(
         list(metric_ids), end_period, months, staging_map, _client,
-        extend_approved=extend_approved, on_progress=_on_progress,
+        extend_approved=extend_approved, on_progress=None,
     )
 
 
@@ -937,17 +1276,15 @@ def _render_trend_charts(client):
     extend_approved = st.session_state.extend_approved
     metrics_catalog, _ = load_catalogs()
 
-    progress_bar = st.progress(0.0, text="추이 계산 준비 중")
-
-    def on_progress(done, total):
-        progress_bar.progress(done / total, text=f"추이 계산 중 ({done}/{total})")
-
-    trend_df = _cached_trend(
-        tuple(CHART_METRIC_IDS), end_period, config.TREND_MONTHS,
-        tuple(sorted(staging_map.items())), extend_approved,
-        client, on_progress,
-    )
-    progress_bar.empty()
+    # 캐시 히트면 즉시 끝나고, 캐시 미스면 실제로 BigQuery를 여러 번 호출하느라
+    # 오래 걸린다 — 세부 진행률(%)은 캐시와 같이 못 쓰므로(위 _cached_trend
+    # 문서 참고) 스피너로만 표시한다.
+    with st.spinner("추이 계산 중"):
+        trend_df = _cached_trend(
+            tuple(CHART_METRIC_IDS), end_period, config.TREND_MONTHS,
+            tuple(sorted(staging_map.items())), extend_approved,
+            client,
+        )
 
     caption_common = f"{end_period}은 업로드 파일로 계산, 그 이전은 기존 테이블"
 
@@ -1084,12 +1421,589 @@ def _render_full_metrics_table(metrics_catalog):
 
 
 # ---------------------------------------------------------------------------
-# 5~8단계 — 오늘은 자리표시자만
+# 5단계 — 내용·검증 결과 확인 (두 번째 게이트)
 # ---------------------------------------------------------------------------
 
-def render_placeholder_step(num: int, name: str):
-    st.header(f"{num}단계 — {name}")
-    st.markdown(status_badge("대기", "대기"), unsafe_allow_html=True)
+CHECKLIST_ITEMS = [
+    "계산 대상 기간이 의도한 기간인가",
+    "경고 항목을 확인했는가",
+    "부분 갱신 지표의 한계를 이해했는가",
+    "자동 검증하지 않은 항목을 인지했는가",
+]
+
+
+def render_step5():
+    """5단계 — 사람 확인 체크리스트 + 두 번째 게이트.
+
+    3단계(검증)는 기계가 문제를 찾는 단계였다. 5단계는 그 결과를 사람이 실제로
+    봤는지 확인하는 단계다 — 체크박스 자체가 뭔가를 다시 검증하지는 않는다.
+    이미 3·4단계에서 나온 사실(경고 건수, 부분 갱신 지표, 자동검증 제외 목록)을
+    사람이 인지했다는 걸 스스로 표시하는 게이트다.
+    """
+    result = st.session_state.validation_result
+    if result is None:
+        return
+
+    st.divider()
+    st.header("5단계 — 내용·검증 결과 확인")
+
+    if result["전체판정"] == "차단":
+        st.markdown(status_badge("차단됨 — 5단계로 진행할 수 없습니다", "차단"), unsafe_allow_html=True)
+        st.write("3단계 검증에서 차단 사유가 해결되기 전까지 다음 단계로 진행할 수 없습니다.")
+        return
+
+    if st.session_state.step5_confirmed_at:
+        st.markdown(status_badge("확인 완료", "완료"), unsafe_allow_html=True)
+        st.write(f"확인 완료 시각: {st.session_state.step5_confirmed_at}")
+        st.caption("이미 만들어진 run_log 기록은 취소해도 지워지지 않습니다.")
+        if st.button("확인 취소"):
+            st.session_state.step5_confirmed_at = None
+            st.session_state.step = 5
+            st.rerun()
+        return
+
+    primary_period = next(iter(st.session_state.profile_result["기간컬럼"].values()))
+    기간_str = f"{primary_period['최소']} ~ {primary_period['최대']}"
+
+    warn_findings = [f for f in result["항목별_결과"] if f["판정"] == "경고" and f["검증명"] == "전월 대비"]
+    partial = [r for r in (st.session_state.metric_results or []) if r.부분갱신]
+    table_name = st.session_state.table_judgment["테이블명"]
+    other_tables = sorted({t for r in partial for t in r.원천 if t != table_name})
+
+    st.write("아래 4가지를 실제로 확인한 뒤 체크해주세요.")
+
+    c1a, c1b = st.columns([1, 20])
+    c1a.checkbox(" ", key="chk_period", label_visibility="collapsed")
+    with c1b:
+        st.write(f"**계산 대상 기간이 의도한 기간인가** ({기간_str})")
+
+    c2a, c2b = st.columns([1, 20])
+    c2a.checkbox(" ", key="chk_warnings", label_visibility="collapsed")
+    with c2b:
+        st.write(f"**경고 항목을 확인했는가** ({len(warn_findings)}건)")
+        if warn_findings:
+            with st.expander("경고 내역 보기"):
+                for f in warn_findings:
+                    st.write(f"- **{f['대상지표']}**: {f['상세']}")
+
+    c3a, c3b = st.columns([1, 20])
+    c3a.checkbox(" ", key="chk_partial", label_visibility="collapsed")
+    with c3b:
+        if partial:
+            names = ", ".join(sorted({r.metric_id for r in partial}))
+            st.write(f"**부분 갱신 지표의 한계를 이해했는가** ({names}는 {', '.join(other_tables)} 이전 상태)")
+        else:
+            st.write("**부분 갱신 지표의 한계를 이해했는가** (이번 실행에는 부분 갱신 지표 없음)")
+
+    c4a, c4b = st.columns([1, 20])
+    c4a.checkbox(" ", key="chk_skipped", label_visibility="collapsed")
+    with c4b:
+        st.write("**자동 검증하지 않은 항목을 인지했는가**")
+        with st.expander("자동 검증하지 않은 항목 보기"):
+            for s in result["자동검증하지_않은_것"]:
+                st.write(f"- **{s['항목']}** — {s['이유']}")
+
+    all_checked = all([
+        st.session_state.chk_period, st.session_state.chk_warnings,
+        st.session_state.chk_partial, st.session_state.chk_skipped,
+    ])
+
+    clicked = st.button("확인 완료, 리포트 생성 단계로", disabled=not all_checked)
+    if not all_checked:
+        st.caption("4가지를 모두 체크해야 다음 단계로 진행할 수 있습니다.")
+
+    if not clicked:
+        return
+
+    run_time = datetime.now()
+    run_dir = Path(st.session_state.run_dir)
+    run_log_path = run_dir / "run_log.json"
+    run_log = json.loads(run_log_path.read_text(encoding="utf-8")) if run_log_path.exists() else {}
+
+    run_log["확인_완료_시각"] = run_time.isoformat()
+    run_log["확인한_체크항목"] = CHECKLIST_ITEMS
+    run_log["검증_요약"] = {
+        "전체판정": result["전체판정"],
+        "차단수": result["차단수"],
+        "경고수": result["경고수"],
+    }
+    run_log["4_5_확인"] = {
+        "게이트2_확정_시각": run_time.isoformat(),
+        "확인한_체크항목": CHECKLIST_ITEMS,
+    }
+    run_log_path.write_text(
+        json.dumps(run_log, ensure_ascii=False, indent=2, default=str), encoding="utf-8"
+    )
+
+    st.session_state.step5_confirmed_at = run_time.isoformat()
+    st.session_state.step = 6  # 6단계는 아직 미구현 -> 사이드바에는 "준비됨"으로 표시됨
+    st.rerun()
+
+
+# ---------------------------------------------------------------------------
+# 6단계 — 리포트 생성 (게이트 2 통과 후)
+# ---------------------------------------------------------------------------
+
+CHAPTER_NAMES = {"1": "Executive Summary", "2": "배경·목적", "3": "데이터·방법론",
+                  "4": "현황", "5": "원인 분석", "6": "개선 제안", "7": "한계", "8": "부록"}
+
+
+def _build_run_context(run_dir: Path) -> dict:
+    """report.py·email_draft.py가 공유하는 run_context를 만든다. 두 모듈이
+    같은 계산 결과·검증 결과를 봐야 이메일이 리포트와 다른 숫자를 말하는
+    일이 없다 — 이 딱 하나의 dict를 두 곳에 그대로 넘긴다."""
+    metrics_catalog, schema_catalog = load_catalogs()
+    insights_catalog = load_insights_catalog()
+
+    run_log = json.loads((run_dir / "run_log.json").read_text(encoding="utf-8"))
+    metrics_df = pd.read_csv(run_dir / "metrics.csv")
+
+    return {
+        "파일명": run_log.get("파일명"),
+        "판정테이블": run_log.get("판정_테이블"),
+        "기간": run_log.get("기간"),
+        "행수": run_log.get("행수"),
+        "metrics": metrics_df,
+        "comparison": st.session_state.comparison_df,
+        "validation": st.session_state.validation_result,
+        "metrics_catalog": metrics_catalog,
+        "schema_catalog": schema_catalog,
+        "insights_catalog": insights_catalog,
+        "run_log": run_log,
+        "run_dir": str(run_dir),
+    }
+
+
+AUTO_GENERATED_CHAPTERS = ["1", "3", "4", "7", "8"]  # report.py가 항상 자동으로 채우는 장(구조상 고정)
+
+
+def _generate_report(run_dir: Path):
+    """report.py를 호출해 리포트를 만들고 파일로 저장한 뒤 session_state에
+    반영한다. "리포트 생성" 버튼과 "사람 작성분 저장" 버튼(저장 후 자동
+    재생성) 둘 다 같은 생성 로직을 타야 하므로 한 곳에 모아둔다 — 따로
+    두면 둘 중 하나만 고치고 다른 쪽을 잊는 일이 생긴다."""
+    run_context = _build_run_context(run_dir)
+
+    t0 = time.time()
+    with st.spinner("리포트 생성 중"):
+        result = reporter.build_report(run_context)
+    소요 = round(time.time() - t0, 3)
+
+    report_path = run_dir / "report.md"
+    report_path.write_text(result["report_md"], encoding="utf-8")
+
+    st.session_state.report_md = result["report_md"]
+    st.session_state.report_path = str(report_path)
+    st.session_state.report_substituted = result["치환된_장"]
+    st.session_state.report_remaining = result["미작성_장"]
+    st.session_state.report_warnings = result["경고"]
+
+    # PDF는 마크다운이 이미 성공한 뒤의 "덤"이다 — 폰트 파일이 없거나 fpdf2가
+    # 없어도 마크다운 리포트 자체는 그대로 살려야 한다(CLAUDE.md 7절 하드
+    # 제약을 지키다 실패해도 6단계 전체를 막을 이유는 아니다).
+    pdf_error = None
+    with st.spinner("PDF 생성 중"):
+        try:
+            pdf_bytes = reporter.build_pdf(result["report_md"])
+            (run_dir / "report.pdf").write_bytes(pdf_bytes)
+        except Exception as e:  # noqa: BLE001
+            pdf_error = str(e)
+    if pdf_error:
+        st.warning(f"PDF 생성에 실패해 마크다운만 저장했습니다: {pdf_error}")
+
+    st.session_state.stage_durations["6_리포트"] = 소요
+    _update_run_log(run_dir, **{
+        "6_리포트": {
+            "생성_시각": datetime.now().isoformat(),
+            "자동생성_장_목록": AUTO_GENERATED_CHAPTERS,
+            "미작성_장_목록": result["미작성_장"],
+            "금지표현_검사_결과": result["금지표현_검사"],
+            "PDF_생성됨": pdf_error is None,
+            "PDF_오류": pdf_error,
+        },
+        "소요시간": dict(st.session_state.stage_durations),
+    })
+
+
+def render_step6():
+    """6단계 — pipeline/report.py로 마크다운 리포트를 만들어 outputs/run_*/report.md에
+    저장하고 화면에 그대로 렌더링한다. PDF·다운로드 버튼은 다음 프롬프트 범위다.
+
+    게이트 2(5단계)를 통과했는지는 step5_confirmed_at만 보고 판단한다 — 5단계
+    자체가 이미 "차단이면 체크리스트를 보여주지 않는다"로 막아뒀으므로, 여기서
+    같은 조건을 또 검사하지 않는다(우회 버튼을 만들지 않는다는 원칙과 같은
+    이유로, 이 단계에 별도의 차단 로직을 두면 5단계와 판정이 어긋날 수 있다).
+    """
+    if not st.session_state.step5_confirmed_at:
+        return
+
+    st.divider()
+    st.header("6단계 — 리포트 생성")
+
+    run_dir = Path(st.session_state.run_dir)
+    run_log = json.loads((run_dir / "run_log.json").read_text(encoding="utf-8"))
+    period = run_log.get("기간", "").split("~")[0].strip()
+
+    if st.button("리포트 생성"):
+        _generate_report(run_dir)
+        st.rerun()
+
+    if st.session_state.report_md:
+        st.markdown(status_badge("생성 완료", "완료"), unsafe_allow_html=True)
+        st.caption(f"저장 위치: {st.session_state.report_path}")
+
+        substituted = st.session_state.report_substituted or []
+        remaining = st.session_state.report_remaining or []
+        warnings = st.session_state.report_warnings or []
+
+        if substituted:
+            names = ", ".join(f"{n}장({CHAPTER_NAMES.get(n, n)})" for n in substituted)
+            st.markdown(status_badge(f"병합된 장: {names}", "통과"), unsafe_allow_html=True)
+        if remaining:
+            names = ", ".join(f"{n}장({CHAPTER_NAMES.get(n, n)})" for n in remaining)
+            st.markdown(status_badge(f"미작성 장: {names}", "경고"), unsafe_allow_html=True)
+        if warnings:
+            for w in warnings:
+                st.markdown(status_badge(w, "경고"), unsafe_allow_html=True)
+
+    with st.expander("사람 작성분 편집"):
+        st.caption(f"manual/sections.md · 대상기간 {period}")
+        editor_key = "manual_editor_text"
+        if editor_key not in st.session_state:
+            st.session_state[editor_key] = manual_sections.read_raw(period)
+
+        st.text_area("2·5·6장 원문", key=editor_key, height=320)
+
+        if st.button("저장하고 리포트 다시 생성"):
+            manual_sections.save_raw(st.session_state[editor_key], period)
+            del st.session_state[editor_key]
+            if st.session_state.report_md:
+                _generate_report(run_dir)
+            st.rerun()
+
+
+# ---------------------------------------------------------------------------
+# 7단계 — 이메일 초안 생성 (리포트 생성 후)
+# ---------------------------------------------------------------------------
+
+def render_step7():
+    """7단계 — pipeline/email_draft.py로 발송 준비 초안(제목·수신·발신·본문
+    html/text·첨부 목록)을 만들어 outputs/run_*/email.html·email.txt·
+    email_meta.json으로 저장하고 화면에 미리보기한다. 실제 발송은 없다
+    (CLAUDE.md 5-3 — SMTP는 8주차).
+
+    6단계(리포트)가 끝났는지는 report_md 존재로만 판단한다 — 5단계 게이트를
+    다시 검사하지 않는 것과 같은 이유로, 이 단계 전용 차단 로직을 새로 만들면
+    6단계 판정과 어긋날 수 있다.
+    """
+    if not st.session_state.report_md:
+        return
+
+    st.divider()
+    st.header("7단계 — 이메일 초안 생성")
+
+    remaining = st.session_state.report_remaining or []
+    if remaining:
+        st.markdown(
+            status_badge(f"리포트 {len(remaining)}개 장이 미작성 상태입니다. 제목에 (초안)이 붙습니다.", "경고"),
+            unsafe_allow_html=True,
+        )
+
+    경고수 = (st.session_state.validation_result or {}).get("경고수", 0)
+    if 경고수:
+        st.markdown(status_badge(f"검증 경고 {경고수}건", "경고"), unsafe_allow_html=True)
+
+    run_dir = Path(st.session_state.run_dir)
+
+    if st.button("이메일 초안 생성"):
+        run_context = _build_run_context(run_dir)
+        t0 = time.time()
+        with st.spinner("이메일 초안 생성 중"):
+            email = email_draft.build_email(run_context, st.session_state.report_md)
+        소요 = round(time.time() - t0, 3)
+        생성_시각 = datetime.now().isoformat()
+
+        html_path = run_dir / "email.html"
+        text_path = run_dir / "email.txt"
+        meta_path = run_dir / "email_meta.json"
+
+        html_path.write_text(email["body_html"], encoding="utf-8")
+        text_path.write_text(email["body_text"], encoding="utf-8")
+        meta_path.write_text(
+            json.dumps(
+                {"subject": email["subject"], "to": email["to"], "from": email["from"],
+                 "attachments": email["attachments"]},
+                ensure_ascii=False, indent=2,
+            ),
+            encoding="utf-8",
+        )
+
+        st.session_state.email_draft = email
+        st.session_state.email_paths = {
+            "html": str(html_path), "text": str(text_path), "meta": str(meta_path),
+        }
+        st.session_state.stage_durations["7_이메일"] = 소요
+        _update_run_log(run_dir, **{
+            "7_이메일": {
+                "제목": email["subject"], "수신자": email["to"],
+                "첨부_목록": email["attachments"], "생성_시각": 생성_시각,
+            },
+            "소요시간": dict(st.session_state.stage_durations),
+        })
+        st.rerun()
+
+    email = st.session_state.email_draft
+    if not email:
+        return
+
+    st.markdown(status_badge("초안 생성 완료", "완료"), unsafe_allow_html=True)
+    st.caption(f"저장 위치: {st.session_state.email_paths['html']}")
+
+    st.write(f"**제목**: {email['subject']}")
+    st.write(f"**수신**: {', '.join(email['to'])}")
+    st.write(f"**발신**: {email['from']}")
+
+    st.subheader("본문 미리보기")
+    st.iframe(email["body_html"], height=600)
+
+    with st.expander("텍스트 버전 보기"):
+        st.text(email["body_text"])
+
+    st.subheader("첨부 목록")
+    c1, c2, c3 = st.columns([3, 2, 2])
+    c1.write("**파일명**")
+    c2.write("**크기**")
+    c3.write("**존재 여부**")
+    for a in email["attachments"]:
+        c1, c2, c3 = st.columns([3, 2, 2])
+        c1.write(a["filename"])
+        if a["size"] is not None:
+            c2.write(f"{a['size']:,}바이트")
+            c3.markdown(status_badge("존재", "완료"), unsafe_allow_html=True)
+        else:
+            c2.write("—")
+            c3.markdown(status_badge("없음", "차단"), unsafe_allow_html=True)
+
+    st.download_button(
+        "이메일 HTML 다운로드",
+        data=email["body_html"],
+        file_name="email.html",
+        mime="text/html",
+    )
+
+
+# ---------------------------------------------------------------------------
+# 8단계 — 발송 확정 (되돌릴 수 없는 마지막 게이트)
+# ---------------------------------------------------------------------------
+
+def _render_step8_done():
+    run_dir = Path(st.session_state.run_dir)
+    st.markdown(status_badge("확정 완료", "완료"), unsafe_allow_html=True)
+    st.write(f"확정 시각: {st.session_state.approved_at}")
+    st.write("저장 위치:")
+    st.write(f"- {run_dir / 'run_log.json'}")
+    st.write(f"- {run_dir / 'APPROVED'}")
+    st.write(f"- {run_dir / 'email_final.html'}")
+
+    if st.button("새 실행 시작"):
+        reset_downstream_state()
+        st.rerun()
+
+
+def render_step8():
+    """8단계 — 발송 확정. CLAUDE.md 1절 "사용자는 넣기 한 번, 승인 세 번만
+    한다"의 마지막 승인이고, 유일하게 되돌릴 수 없는 지점이다 — 그래서
+    2·5단계 게이트보다 확인 항목이 많다(5개).
+
+    7단계(이메일 초안)가 끝났는지는 email_draft 존재로 판단한다. 검증 차단은
+    이론상 5단계에서 이미 막혀 여기까지 오지 않지만, "되돌릴 수 없는 마지막
+    지점"이라는 이 단계의 성격상 명시적으로 요청받은 대로 한 번 더 확인하고
+    확정 버튼 자체를 만들지 않는다 — 다른 단계에서 "이미 위에서 막았으니
+    다시 검사하지 않는다"고 판단한 것과는 다르게, 여기는 사용자가 이 검사를
+    분명히 원했다.
+    """
+    if not st.session_state.email_draft:
+        return
+
+    st.divider()
+    st.header("8단계 — 발송 확정")
+
+    if st.session_state.approved_at:
+        _render_step8_done()
+        return
+
+    validation = st.session_state.validation_result or {}
+    if validation.get("전체판정") == "차단":
+        st.markdown(status_badge("차단됨 — 발송을 확정할 수 없습니다", "차단"), unsafe_allow_html=True)
+        for f in validation.get("항목별_결과", []):
+            if f.get("판정") == "차단":
+                st.write(f"- **{f['대상지표']}**: {f['상세']}")
+        return
+
+    run_dir = Path(st.session_state.run_dir)
+    run_log = json.loads((run_dir / "run_log.json").read_text(encoding="utf-8"))
+    period = run_log.get("기간", "").split("~")[0].strip()
+    email = st.session_state.email_draft
+    remaining = st.session_state.report_remaining or []
+    경고수 = validation.get("경고수", 0)
+
+    st.write("아래 5가지를 실제로 확인한 뒤 체크해주세요.")
+    checklist = {}
+
+    checklist["기간"] = f"대상 기간이 맞다 ({period})"
+    c1a, c1b = st.columns([1, 20])
+    c1a.checkbox(" ", key="chk8_period", label_visibility="collapsed")
+    c1b.write(f"**{checklist['기간']}**")
+
+    checklist["수신자"] = f"수신자가 맞다 ({', '.join(email['to'])})"
+    c2a, c2b = st.columns([1, 20])
+    c2a.checkbox(" ", key="chk8_recipients", label_visibility="collapsed")
+    c2b.write(f"**{checklist['수신자']}**")
+
+    checklist["경고"] = f"검증 경고 {경고수}건을 확인했다"
+    c3a, c3b = st.columns([1, 20])
+    c3a.checkbox(" ", key="chk8_warnings", label_visibility="collapsed")
+    c3b.write(f"**{checklist['경고']}**")
+
+    if remaining:
+        names = "·".join(CHAPTER_NAMES.get(n, n) for n in remaining)
+        nums = "·".join(f"{n}장" for n in remaining)
+        checklist["미작성"] = f"{nums}({names})이 비어 있는 상태로 발송하는 것을 확인했습니다"
+    else:
+        checklist["미작성"] = "미작성 장이 없음을 확인했다"
+    c4a, c4b = st.columns([1, 20])
+    c4a.checkbox(" ", key="chk8_unwritten", label_visibility="collapsed")
+    with c4b:
+        st.write(f"**{checklist['미작성']}**")
+        if remaining:
+            st.caption("초안 공유가 목적일 수 있으므로 차단하지 않습니다. 대신 제목에 (초안)이 표시됩니다.")
+
+    checklist["첨부"] = "첨부 파일 목록을 확인했다"
+    c5a, c5b = st.columns([1, 20])
+    c5a.checkbox(" ", key="chk8_attachments", label_visibility="collapsed")
+    with c5b:
+        st.write(f"**{checklist['첨부']}**")
+        for a in email["attachments"]:
+            상태 = "존재" if a["size"] is not None else "없음"
+            st.caption(f"- {a['filename']} ({상태})")
+
+    all_checked = all([
+        st.session_state.chk8_period, st.session_state.chk8_recipients,
+        st.session_state.chk8_warnings, st.session_state.chk8_unwritten,
+        st.session_state.chk8_attachments,
+    ])
+
+    st.divider()
+    st.markdown(status_badge("되돌릴 수 없음", "차단"), unsafe_allow_html=True)
+    st.warning(
+        "확정하면 발송 준비 최종본이 저장됩니다. 이 앱은 실제로 메일을 "
+        "보내지 않습니다(8주차에 구현)."
+    )
+
+    clicked = st.button("발송 확정", type="primary", disabled=not all_checked)
+    if not all_checked:
+        st.caption("5가지를 모두 체크해야 확정할 수 있습니다.")
+
+    if not clicked:
+        return
+
+    run_time = datetime.now()
+    (run_dir / "email_final.html").write_text(email["body_html"], encoding="utf-8")
+
+    확정정보 = {
+        "발송확정_시각": run_time.isoformat(),
+        "확인한_체크항목": list(checklist.values()),
+        "제목": email["subject"],
+        "수신자": email["to"],
+        "미작성_장_목록": remaining,
+        "검증_경고수": 경고수,
+        "첨부_목록": email["attachments"],
+    }
+
+    (run_dir / "APPROVED").write_text(
+        json.dumps(확정정보, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+    run_log.update(확정정보)
+    run_log["8_확정"] = {
+        "발송확정_시각": 확정정보["발송확정_시각"],
+        "확인한_체크항목": 확정정보["확인한_체크항목"],
+    }
+    (run_dir / "run_log.json").write_text(
+        json.dumps(run_log, ensure_ascii=False, indent=2, default=str), encoding="utf-8"
+    )
+
+    st.session_state.approved_at = run_time.isoformat()
+    st.session_state.step = 9  # STEPS는 8까지뿐 — 사이드바에 8단계까지 전부 "완료"로 표시하려는 것
+    st.rerun()
+
+
+# ---------------------------------------------------------------------------
+# 실행 기록 보기 — run_log.json을 사람이 읽는 표로
+# ---------------------------------------------------------------------------
+
+def _log_display(v):
+    """표에 넣기 전 값 하나를 항상 문자열로 만든다. run_log.json의 "값" 같은
+    칸은 실행마다 int·str·None·list가 뒤섞여 들어올 수 있는데, 섞인 채로
+    DataFrame에 넣으면 pyarrow가 컬럼 타입을 하나로 못 정해 통째로 죽는다
+    (실측: "Expected bytes, got a 'int' object"로 렌더링 자체가 깨졌다).
+    표시가 목적이라 타입을 살릴 이유가 없어, 전부 문자열로 통일한다."""
+    if v is None:
+        return "—"
+    if isinstance(v, (dict, list)):
+        return json.dumps(v, ensure_ascii=False)
+    return str(v)
+
+
+def _render_log_value(value):
+    """run_log.json의 값 하나를 종류에 맞게 표/목록/텍스트로 그린다.
+    run_log가 "N_단계" 별로 서로 다른 모양(스칼라 모음, 리스트, dict의 dict)을
+    섞어 담고 있어서, 구조를 미리 정해두지 않고 값의 실제 타입으로 분기한다
+    — 8단계 전체를 한 함수가 다 알고 있어야 하는 하드코딩을 피한다."""
+    if isinstance(value, dict):
+        if not value:
+            st.caption("(없음)")
+            return
+        scalar_rows = []
+        for k, v in value.items():
+            if isinstance(v, (dict, list)) and v:
+                with st.expander(str(k)):
+                    _render_log_value(v)
+            else:
+                scalar_rows.append({"항목": k, "값": _log_display(v)})
+        if scalar_rows:
+            st.dataframe(pd.DataFrame(scalar_rows), hide_index=True, width="stretch")
+    elif isinstance(value, list):
+        if not value:
+            st.caption("(없음)")
+        elif all(isinstance(x, dict) for x in value):
+            rows = [{k: _log_display(v) for k, v in row.items()} for row in value]
+            st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+        else:
+            for x in value:
+                st.write(f"- {_log_display(x)}")
+    else:
+        st.write(_log_display(value))
+
+
+def render_run_log_viewer():
+    """run_log.json 전체를 화면에서 훑어볼 수 있게 한다. 파일을 매번 다시
+    읽는다 — session_state에 캐싱하면 이 실행 도중 계속 갱신되는 run_log.json의
+    최신 상태를 놓친다."""
+    if not st.session_state.run_dir:
+        return
+
+    run_log_path = Path(st.session_state.run_dir) / "run_log.json"
+    if not run_log_path.exists():
+        return
+
+    st.divider()
+    with st.expander("실행 기록 보기 (run_log.json)"):
+        st.caption(f"경로: {run_log_path}")
+        run_log = json.loads(run_log_path.read_text(encoding="utf-8"))
+        for section, value in run_log.items():
+            st.subheader(section)
+            _render_log_value(value)
 
 
 # ---------------------------------------------------------------------------
@@ -1107,9 +2021,11 @@ def main():
     render_comparison()
     render_validation()
     render_dashboard_top()
-
-    for num, name in STEPS[4:]:
-        render_placeholder_step(num, name)
+    render_step5()
+    render_step6()
+    render_step7()
+    render_step8()
+    render_run_log_viewer()
 
 
 if __name__ == "__main__":
