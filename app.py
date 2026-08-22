@@ -1809,6 +1809,20 @@ def render_step7():
             c2.write("—")
             c3.markdown(status_badge("없음", "차단"), unsafe_allow_html=True)
 
+    pdf_attachment = next(
+        (a for a in email["attachments"] if a["filename"] == "report.pdf" and a["size"] is not None), None,
+    )
+    if pdf_attachment:
+        with st.expander("report.pdf 미리보기"):
+            st.iframe(Path(pdf_attachment["path"]), height=700)
+        with open(pdf_attachment["path"], "rb") as f:
+            st.download_button(
+                "report.pdf 다운로드",
+                data=f.read(),
+                file_name="report.pdf",
+                mime="application/pdf",
+            )
+
     st.download_button(
         "이메일 HTML 다운로드",
         data=email["body_html"],
