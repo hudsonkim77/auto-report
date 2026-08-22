@@ -14,11 +14,27 @@ APP_DIR = Path(__file__).resolve().parent
 
 
 def _find_wiki_path():
-    """형제 폴더 중 06_metrics 폴더를 가진 첫 번째 폴더를 위키 경로로 본다."""
+    """형제 폴더 중 06_metrics 폴더를 가진 첫 번째 폴더를 위키 경로로 본다.
+
+    OSError를 잡는 이유: 이 탐색은 앱 폴더 "바깥"(부모 폴더)을 들여다본다.
+    로컬에선 문제없지만, Streamlit Community Cloud처럼 앱이 샌드박스
+    컨테이너에서 도는 환경은 저장소 바깥 디렉터리 나열 자체를 막을 수 있다
+    (실측 — 배포본에서 이 줄 때문에 앱이 시작도 못 하고 OSError로 죽었다).
+    WIKI_PATH=None은 이미 정상적으로 지원되는 상태다(export_catalog.py만
+    쓰고, 배포된 앱 자체는 카탈로그 JSON만 읽는다) — 그래서 탐색이 막히면
+    "못 찾았다"로 조용히 넘어가고, 앱 시작을 막지 않는다.
+    """
     parent = APP_DIR.parent
-    for sibling in sorted(parent.iterdir()):
-        if sibling.is_dir() and sibling != APP_DIR and (sibling / "06_metrics").is_dir():
-            return sibling.resolve()
+    try:
+        siblings = sorted(parent.iterdir())
+    except OSError:
+        return None
+    for sibling in siblings:
+        try:
+            if sibling.is_dir() and sibling != APP_DIR and (sibling / "06_metrics").is_dir():
+                return sibling.resolve()
+        except OSError:
+            continue
     return None
 
 
