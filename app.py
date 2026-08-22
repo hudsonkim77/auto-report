@@ -757,11 +757,16 @@ def render_gate():
     df = st.session_state.df
     table_name = table_judgment["테이블명"]
 
+    # 이 실행 하나를 식별하는 고유 id — 스테이징 테이블명과 run 폴더명에 똑같이
+    # 붙인다. 계산 시도 "전에" 만드는 이유: 실패해도 흔적을 안 남긴다는 원칙과
+    # 별개로, 스테이징 테이블 이름 자체가 이 id를 필요로 하기 때문이다.
+    run_id = calculator.new_run_id()
+
     t0 = time.time()
     try:
         with st.spinner("스테이징 적재 중"):
             client = calculator.get_client()
-            staging_table = calculator.load_staging_table(df, table_name, client)
+            staging_table = calculator.load_staging_table(df, table_name, client, run_id)
         with st.spinner("지표 계산 중"):
             results, sql_log = calculator.compute_target_metrics(
                 target_ids, table_name, staging_table,
@@ -778,7 +783,9 @@ def render_gate():
 
     # --- 확정 처리(계산 성공 후에만) ---
     run_time = datetime.now()
-    run_dir = APP_DIR / "outputs" / run_time.strftime("run_%Y%m%d_%H%M")
+    # 폴더명도 스테이징 테이블과 같은 run_id를 쓴다 — 분 단위 폴더명(예전 방식)은
+    # 클라우드에서 여러 사용자가 같은 분에 확정하면 서로 폴더를 덮어쓸 수 있다.
+    run_dir = APP_DIR / "outputs" / f"run_{run_id}"
     run_dir.mkdir(parents=True, exist_ok=True)
 
     # 업로드 원본을 그대로 복사한다(CLAUDE.md 5-5 재현성): 나중에 이 실행을 그대로
@@ -1665,6 +1672,12 @@ def render_step6():
         if warnings:
             for w in warnings:
                 st.markdown(status_badge(w, "경고"), unsafe_allow_html=True)
+
+        # 리포트 본문 미리보기 — "생성 완료" 배지만 보여주고 실제 내용은
+        # 안 그리는 회귀가 있었다(병합/미작성 장 배지를 추가하면서 이 줄이
+        # 빠졌다, 실측으로 확인함). 그때 만든 마크다운을 화면에 그대로 낸다.
+        st.divider()
+        st.markdown(st.session_state.report_md)
 
     with st.expander("사람 작성분 편집"):
         st.caption(f"manual/sections.md · 대상기간 {period}")

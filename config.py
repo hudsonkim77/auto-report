@@ -49,6 +49,11 @@ if WIKI_PATH is None:
 BQ_PROJECT = None  # None이면 ADC 기본 프로젝트를 사용한다
 BQ_DATASET = "project1_day1"
 STAGING_PREFIX = "staging_"
+# 스테이징 테이블 하나당 수명(일). 이름에 실행 고유 id가 붙어 실행마다 새
+# 테이블이 생기므로(설계: 클라우드에서 여러 실행이 동시에 같은 원본 테이블을
+# 대상으로 돌아도 서로 안 덮어쓰게), 오래된 테이블이 영원히 쌓이지 않도록
+# 만료 시간을 걸어 BigQuery가 스스로 정리하게 한다.
+STAGING_TABLE_TTL_DAYS = 7
 
 # --- 이메일(초안용, 실제 발송 없음) ---
 EMAIL_TO = "team@example.com"

@@ -19,6 +19,7 @@ import calendar
 import datetime as dt
 import json
 import re
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -110,24 +111,55 @@ def get_client() -> bigquery.Client:
         raise AuthError(str(e)) from e
 
 
-def load_staging_table(df: pd.DataFrame, table_name: str, client: bigquery.Client) -> str:
-    """업로드된 df를 {STAGING_PREFIX}{table_name}으로 적재한다.
+def new_run_id() -> str:
+    """이 실행 하나를 식별하는 고유 id(시각+짧은 무작위값)를 만든다.
+
+    스테이징 테이블명과 run 폴더명에 똑같이 붙여서, 나중에 "이 run이 어느
+    스테이징 테이블을 썼는지"를 이름만 보고 바로 알 수 있게 한다.
+
+    분 단위 시각만 쓰지 않는 이유: 로컬에서 혼자 쓸 때는 안 보이지만,
+    Streamlit Cloud처럼 여러 사용자가 동시에 같은 원본 테이블을 대상으로
+    실행할 수 있는 환경에서는 같은 분(심지어 같은 초)에 두 실행이 겹칠 수
+    있다 — 그러면 옛 설계(테이블명당 스테이징 하나)에서는 나중 실행이 앞
+    실행의 스테이징을 덮어써 버린다. 무작위 값을 더해 이 충돌을 없앤다.
+    """
+    ts = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+    return f"{ts}_{uuid.uuid4().hex[:6]}"
+
+
+def load_staging_table(df: pd.DataFrame, table_name: str, client: bigquery.Client, run_id: str) -> str:
+    """업로드된 df를 {STAGING_PREFIX}{table_name}_{run_id}로 적재한다.
 
     왜 적재(LOAD JOB)이지 INSERT(DML)가 아닌가: CLAUDE.md 5-2 — DML은 BigQuery
     샌드박스에서 차단된다. load_table_from_dataframe + WRITE_TRUNCATE는 DDL(테이블
     재생성) 성격이라 결제 계정 없이도 동작한다.
 
     왜 원본 테이블이 아니라 STAGING_PREFIX를 붙인 별도 테이블인가: 원본 테이블에
-    데이터를 붙이면 실행마다 원본이 오염되고 되돌릴 수 없다. 스테이징은 실행마다
-    통째로 교체(WRITE_TRUNCATE)하므로 이전 실행의 흔적이 안 남는다.
+    데이터를 붙이면 실행마다 원본이 오염되고 되돌릴 수 없다.
+
+    왜 테이블명에 run_id까지 붙이는가(설계 변경, CLAUDE.md 5-2 갱신 이력 참고):
+    처음엔 테이블명당 스테이징 하나(WRITE_TRUNCATE로 매번 교체)였는데, 이건
+    "한 번에 한 사람만 쓴다"는 전제에서만 안전하다. 클라우드에 배포되면 여러
+    실행이 겹칠 수 있고, 그때 나중 실행이 앞 실행의 스테이징을 덮어써 버리면
+    앞 실행이 나중에 "기존 실행 불러오기"로 다시 열렸을 때 잘못된(다른 실행의)
+    데이터를 보게 된다 — 실제로 그 위험을 감지하고 바꿨다. run_id를 붙이면
+    실행마다 완전히 새 테이블이라 서로 절대 안 겹친다.
+
+    만료 시간(TTL)을 거는 이유: 실행마다 새 테이블이 계속 쌓이면 정리가
+    안 된다. config.STAGING_TABLE_TTL_DAYS 뒤에 BigQuery가 스스로 지우게
+    한다 — 사람이 따로 정리 스크립트를 돌릴 필요가 없다.
     """
-    staging_table = f"{config.STAGING_PREFIX}{table_name}"
+    staging_table = f"{config.STAGING_PREFIX}{table_name}_{run_id}"
     table_id = f"{config.BQ_DATASET}.{staging_table}"
 
     job_config = bigquery.LoadJobConfig(write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE)
     try:
         job = client.load_table_from_dataframe(df, table_id, job_config=job_config)
         job.result()
+
+        table_ref = client.get_table(table_id)
+        table_ref.expires = dt.datetime.now(dt.timezone.utc) + dt.timedelta(days=config.STAGING_TABLE_TTL_DAYS)
+        client.update_table(table_ref, ["expires"])
     except auth_exceptions.DefaultCredentialsError as e:
         raise AuthError(str(e)) from e
     except gax_exceptions.Forbidden as e:
@@ -503,7 +535,7 @@ def calculate_metrics(
 
     notify("스테이징 적재 중")
     client = get_client()
-    staging_table = load_staging_table(df, table_name, client)
+    staging_table = load_staging_table(df, table_name, client, new_run_id())
 
     notify("지표 계산 중")
     return compute_target_metrics(
