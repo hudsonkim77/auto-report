@@ -69,10 +69,42 @@ class MetricResult:
 # 1단계 — 스테이징 적재
 # ---------------------------------------------------------------------------
 
+def _cloud_credentials():
+    """Streamlit Secrets에 서비스 계정이 있으면 (credentials, project_id)를,
+    없으면 (None, None)을 반환한다.
+
+    왜 필요한가: 로컬에서는 `gcloud auth application-default login`으로 ADC를
+    쓰지만, Streamlit Community Cloud에는 그 로그인 세션이 없다 — 대신
+    Streamlit의 Secrets(로컬은 .streamlit/secrets.toml, 배포본은 앱 설정 화면)에
+    서비스 계정 JSON을 넣어두고 그걸로 인증해야 한다.
+
+    streamlit이 없거나 secrets에 그 키가 없으면 조용히 (None, None)을 반환한다
+    — 이건 "인증 실패"가 아니라 "이 경로를 쓰지 않는다"는 뜻이라 예외로 다루지
+    않는다. 그래서 로컬 CLI(run_pipeline.py)·기존 ADC 흐름은 아무 변화 없이
+    그대로 동작한다.
+    """
+    try:
+        import streamlit as st
+        if "gcp_service_account" not in st.secrets:
+            return None, None
+        info = dict(st.secrets["gcp_service_account"])
+    except Exception:  # noqa: BLE001 - streamlit 미설치·secrets 파일 없음 등, 전부 "이 경로 없음"
+        return None, None
+
+    from google.oauth2 import service_account
+    credentials = service_account.Credentials.from_service_account_info(
+        info, scopes=["https://www.googleapis.com/auth/bigquery"],
+    )
+    return credentials, info.get("project_id")
+
+
 def get_client() -> bigquery.Client:
     """BigQuery 클라이언트를 만든다. 인증이 안 돼 있으면 AuthError로 바꿔서
     호출자가 "원인 + gcloud 명령"을 화면에 보여줄 수 있게 한다."""
     try:
+        credentials, cloud_project = _cloud_credentials()
+        if credentials is not None:
+            return bigquery.Client(project=config.BQ_PROJECT or cloud_project, credentials=credentials)
         return bigquery.Client(project=config.BQ_PROJECT) if config.BQ_PROJECT else bigquery.Client()
     except auth_exceptions.DefaultCredentialsError as e:
         raise AuthError(str(e)) from e
